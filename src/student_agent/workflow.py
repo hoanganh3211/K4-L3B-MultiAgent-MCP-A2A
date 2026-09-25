@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -387,6 +388,24 @@ async def _synthesize(
             "warnings": ev.get("warnings", []),
         })
 
+    client = _openai()
+    
+    # Read the schema to guide the LLM
+    try:
+        import pathlib
+        base_path = pathlib.Path("contracts/schemas/l3a-output-v2.schema.json")
+        base_data = json.loads(base_path.read_text(encoding="utf-8"))
+        base_defs = base_data.get("$defs", {})
+        
+        schema_path = pathlib.Path("contracts/schemas/l3b-output-v2.schema.json")
+        schema_data = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema_props = schema_data.get("properties", {})
+        
+        # We supply the top-level properties and the definitions they reference
+        schema_hint = f"\n\nJSON SCHEMA PROPERTIES TO FOLLOW EXACTLY:\n{json.dumps(schema_props, indent=2)}\n\nREFERENCED DEFINITIONS:\n{json.dumps(base_defs, indent=2)}"
+    except Exception:
+        schema_hint = ""
+
     user_prompt = f"""Analyze this e-commerce complaint case and produce a JSON output.
 
 CASE ID: {case_id}
@@ -409,7 +428,7 @@ Produce the final JSON output with ALL required fields:
 
 Also include claim_assessments for each claim.
 Remember: schema_version must be "day09-l3b-output-v2", currency must be "BRL".
-Analyze evidence carefully. If data is missing, use "insufficient_evidence" verdicts."""
+Analyze evidence carefully. If data is missing, use "insufficient_evidence" verdicts.{schema_hint}"""
 
     client = _openai()
     response = await client.chat.completions.create(
@@ -424,6 +443,7 @@ Analyze evidence carefully. If data is missing, use "insufficient_evidence" verd
     )
 
     text = response.choices[0].message.content or "{}"
+    print("RAW LLM OUTPUT:", text)
     result = json.loads(text)
 
     # ── post-process to ensure schema compliance ──
@@ -433,7 +453,14 @@ Analyze evidence carefully. If data is missing, use "insufficient_evidence" verd
     # Ensure all evidence_refs in output actually exist
     valid_refs = set(all_refs)
     if "evidence_refs" in result:
-        result["evidence_refs"] = [r for r in result["evidence_refs"] if r in valid_refs]
+        # Deduplicate while preserving order
+        unique_result_refs = []
+        seen_result_refs = set()
+        for r in result["evidence_refs"]:
+            if r in valid_refs and r not in seen_result_refs:
+                seen_result_refs.add(r)
+                unique_result_refs.append(r)
+        result["evidence_refs"] = unique_result_refs
     else:
         result["evidence_refs"] = list(all_refs)
 
@@ -821,26 +848,20 @@ async def solve_case(
         all_evidence.extend(ev_list)
         all_refs.extend(ref_list)
 
-    # 1. Entity resolution
-    _collect(await _entity_agent(case, gateway, trace, available_tools))
-
-    # 2. Customer context
-    _collect(await _customer_agent(case, gateway, trace, available_tools))
-
-    # 3. Shipment analysis
-    _collect(await _shipment_agent(case, gateway, trace, available_tools, claimed_order))
-
-    # 4. Payment & refund analysis
-    _collect(await _payment_agent(case, gateway, trace, available_tools, claimed_order))
-
-    # 5. Product context + order items (always fetch for full evidence coverage)
-    _collect(await _product_agent(case, gateway, trace, available_tools, claimed_order))
-
-    # 6. Policy check
-    _collect(await _policy_agent(case, gateway, trace, available_tools))
-
-    # 7. Seller info (get_sellers takes order_id, not seller_id)
-    _collect(await _seller_agent(case, gateway, trace, available_tools, claimed_order))
+    # Run all specialist agents concurrently to fetch evidence
+    tasks = [
+        _entity_agent(case, gateway, trace, available_tools),
+        _customer_agent(case, gateway, trace, available_tools),
+        _shipment_agent(case, gateway, trace, available_tools, claimed_order),
+        _payment_agent(case, gateway, trace, available_tools, claimed_order),
+        _product_agent(case, gateway, trace, available_tools, claimed_order),
+        _policy_agent(case, gateway, trace, available_tools),
+        _seller_agent(case, gateway, trace, available_tools, claimed_order)
+    ]
+    results = await asyncio.gather(*tasks)
+    
+    for res in results:
+        _collect(res)
 
     # Deduplicate refs
     seen: set[str] = set()
@@ -867,7 +888,7 @@ async def solve_case(
 
     # Ensure output evidence_refs only contain valid refs
     valid = set(all_refs)
-    output["evidence_refs"] = [r for r in output.get("evidence_refs", []) if r in valid]
+    output["evidence_refs"] = list(dict.fromkeys(r for r in output.get("evidence_refs", []) if r in valid))
     if not output["evidence_refs"] and all_refs:
         output["evidence_refs"] = all_refs
 
